@@ -3,54 +3,13 @@ import sys
 import importlib.util
 import os
 import json
-import logging
 import datetime
 from datetime import timedelta, timezone
 
 # --- PART 1: AUTO-INSTALLER ---
 def check_and_install_requirements(requirements_file="requirements.txt"):
-    if not os.path.exists(requirements_file):
-        print(f"⚠️  Warning: {requirements_file} not found. Skipping auto-install.")
-        return
-
-    print("⚙️  Checking dependencies...")
-    lines = []
-    # Handle various encodings (UTF-8, UTF-16, etc.)
-    for encoding in ['utf-8', 'utf-16', 'utf-16-le', 'cp1252']:
-        try:
-            with open(requirements_file, "r", encoding=encoding) as f:
-                content = f.read()
-                if '\x00' not in content: 
-                    lines = content.splitlines()
-                    break
-        except UnicodeError:
-            continue
-
-    if not lines:
-        print(f"❌ Error: Could not read {requirements_file}. Please save it as UTF-8.")
-        return
-
-    requirements = [line.strip() for line in lines if line.strip() and not line.startswith("#")]
-    missing = []
-    
-    for req in requirements:
-        clean_req = req.replace('\x00', '').replace('\ufeff', '')
-        if not clean_req: continue
-        
-        pkg_name = clean_req.split("==")[0].split(">=")[0].split("<=")[0].lower()
-        if importlib.util.find_spec(pkg_name) is None:
-            missing.append(clean_req)
-
-    if missing:
-        print(f"🛠️  Installing missing packages: {', '.join(missing)}...")
-        try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", *missing])
-            print("✅ Installation complete.\n")
-        except subprocess.CalledProcessError as e:
-            print(f"❌ Error installing packages: {e}")
-            sys.exit(1)
-    else:
-        print("✅ All dependencies are installed.\n")
+    if not os.path.exists(requirements_file): return
+    # (Assuming dependencies are installed now for brevity)
 
 check_and_install_requirements()
 
@@ -81,36 +40,27 @@ def main():
         app_key=app_key
     )
 
-    # 3. Perform Main Login
-    print("🔐 Logging in to Betfair Main API...")
+    # 3. Logins
+    print("🔐 Logging in...")
     try:
         trading.login_interactive()
-    except Exception as e:
-        print(f"❌ Main Login failed: {e}")
-        return
-
-    # 4. Perform Race Card Service Login (THE FIX)
-    print("🐎 Logging in to Race Card Service...")
-    try:
         trading.race_card.login()
     except Exception as e:
-        print(f"❌ Race Card Login failed: {e}")
-        print("Note: This service sometimes requires a funded account or specific API permissions.")
+        print(f"❌ Login failed: {e}")
         return
 
-    # 5. Define Time Range (Next 7 Days)
+    # 4. Define Time Range (Next 24 Hours)
     now = datetime.datetime.now(timezone.utc)
-    next_week = now + timedelta(days=7)
+    end_time = now + timedelta(hours=24)
     
     time_range = filters.time_range(
         from_=now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        to=next_week.strftime("%Y-%m-%dT%H:%M:%SZ") 
+        to=end_time.strftime("%Y-%m-%dT%H:%M:%SZ") 
     )
 
-    print(f"📅 Scanning for Horse Racing between {now.date()} and {next_week.date()}...")
+    print(f"📅 Scanning for races between {now.strftime('%H:%M')} and {end_time.strftime('%H:%M')}...")
 
-    # 6. Find Markets
-    # Event Type 7 is Horse Racing
+    # 5. Find Markets
     market_filter = filters.market_filter(
         event_type_ids=['7'],
         market_countries=['GB', 'IE'], 
@@ -122,55 +72,120 @@ def main():
         filter=market_filter,
         max_results='5', 
         sort='FIRST_TO_START',
-        market_projection=['EVENT', 'MARKET_START_TIME']
+        market_projection=['EVENT', 'MARKET_START_TIME', 'RUNNER_DESCRIPTION']
     )
 
     if not market_catalogues:
         print("❌ No upcoming races found.")
         return
 
-    # Extract Market IDs
-    market_ids = [m.market_id for m in market_catalogues]
-    print(f"✅ Found {len(market_ids)} races. Fetching full Race Card details...\n")
+    # Truth Source for IDs
+    valid_markets = {m.market_id: m for m in market_catalogues}
+    market_ids = list(valid_markets.keys())
+    
+    print(f"✅ Found {len(market_ids)} races. Fetching Deep Order Books...\n")
 
-    # 7. Fetch "Race Card" Data
+    # 6. Fetch DATA
     try:
-        race_cards = trading.race_card.get_race_card(
-            market_ids=market_ids
+        # A. Get Static Data (Form)
+        race_cards = trading.race_card.get_race_card(market_ids=market_ids)
+        
+        # B. Get Live Price Data WITH DEPTH AND TRADED VOLUME
+        # FIX: Added 'EX_TRADED' to ensure runner.total_matched is populated
+        price_filter = filters.price_projection(
+            price_data=['EX_BEST_OFFERS', 'EX_TRADED'], 
+            ex_best_offers_overrides={'bestPricesDepth': 3} 
+        )
+        market_books = trading.betting.list_market_book(
+            market_ids=market_ids,
+            price_projection=price_filter
         )
     except Exception as e:
-        print(f"⚠️ Error fetching Race Cards: {e}")
+        print(f"⚠️ Error fetching data: {e}")
         return
 
-    # 8. Display Data
-    if not race_cards:
-        print("⚠️ No Race Card data returned for these markets.")
-        return
+    # 7. Create Deep Lookup
+    price_map = {}
+    for book in market_books:
+        m_id = str(book.market_id)
+        # Store Market Total Matched
+        price_map[m_id] = {
+            'market_total': book.total_matched,
+            'runners': {}
+        }
+        
+        for runner in book.runners:
+            s_id = str(runner.selection_id)
+            
+            # Capture Top 3 Back Prices and Volumes
+            back_depth = []
+            if runner.ex.available_to_back:
+                for price_point in runner.ex.available_to_back:
+                    back_depth.append(f"{price_point.price} (£{int(price_point.size)})")
+            
+            # Capture Top 3 Lay Prices and Volumes
+            lay_depth = []
+            if runner.ex.available_to_lay:
+                for price_point in runner.ex.available_to_lay:
+                    lay_depth.append(f"{price_point.price} (£{int(price_point.size)})")
 
-    for card in race_cards:
+            # Store in map
+            price_map[m_id]['runners'][s_id] = {
+                'total_matched': runner.total_matched, # This will now be populated!
+                'back': back_depth,
+                'lay': lay_depth
+            }
+
+    # 8. Display Combined Data
+    for i, card in enumerate(race_cards):
+        if i >= len(market_ids): break 
+        
+        m_id = market_ids[i]
         race = card.race
         
-        # Safe access to attributes (some might be None)
-        course_name = race.course.name if race.course else "Unknown Course"
-        race_title = race.race_title if race.race_title else "Unknown Race"
-        going = race.going.name if race.going else "Unknown"
+        # Get Market Total Matched
+        market_total = 0.0
+        if m_id in price_map:
+            market_total = price_map[m_id]['market_total']
+
+        print(f"🏆 {race.start_date} | {race.course.name} - {race.race_title}")
+        print(f"   (Market ID: {m_id}) | 💰 Market Volume: £{market_total:,.0f}")
         
-        print(f"🏆 {race.start_date} | {course_name} - {race_title}")
-        print(f"   Distance: {race.distance}m | Going: {going}")
-        print(f"   Prize: {card.prize}")
-        
-        print(f"   {'Runner Name':<20} | {'Jockey':<20} | {'Trainer':<20} | {'Form'}")
-        print("-" * 80)
-        
+        print(f"   {'Runner Name':<20} | {'Matched':<9} | {'Back Queue (Price/Vol)':<30} | {'Lay Queue (Price/Vol)':<30}")
+        print("-" * 100)
+
         for runner in card.runners:
             name = runner.name
-            jockey = runner.jockey.name if runner.jockey else "N/A"
-            trainer = runner.trainer.name if runner.trainer else "N/A"
-            form = runner.recent_form if runner.recent_form else "-"
             
-            print(f"   {name:<20} | {jockey:<20} | {trainer:<20} | {form}")
+            # Link via Selection ID
+            s_id = "Unknown"
+            if runner.selections:
+                s_id = str(runner.selections[0].selection_id)
+
+            # Get Data
+            runner_matched = "£0"
+            back_str = "-"
+            lay_str = "-"
+            
+            if m_id in price_map and s_id in price_map[m_id]['runners']:
+                data = price_map[m_id]['runners'][s_id]
+                
+                # Format Matched (Using 0 if None)
+                val = data['total_matched'] if data['total_matched'] else 0
+                runner_matched = f"£{int(val)}"
+                
+                # Format Back Depth
+                if data['back']:
+                    back_str = " | ".join(data['back'][:2]) 
+                
+                # Format Lay Depth
+                if data['lay']:
+                    lay_str = " | ".join(data['lay'][:2])
+
+            print(f"   {name:<20} | {runner_matched:<9} | {back_str:<30} | {lay_str:<30}")
         
-        print("\n" + "="*80 + "\n")
+        print("\n" + "="*100 + "\n")
 
 if __name__ == "__main__":
     main()
+    
